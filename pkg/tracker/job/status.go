@@ -15,6 +15,7 @@ type JobStatus struct {
 	batchv1.JobStatus
 
 	StatusGeneration uint64
+	Generation       int64
 
 	SucceededIndicator *indicators.Int32EqualConditionIndicator
 	Age                string
@@ -32,6 +33,7 @@ func NewJobStatus(object *batchv1.Job, statusGeneration uint64, isTrackerFailed 
 	res := JobStatus{
 		JobStatus:        object.Status,
 		StatusGeneration: statusGeneration,
+		Generation:       object.Generation,
 		Age:              utils.TranslateTimestampSince(object.CreationTimestamp),
 		Pods:             make(map[string]pod.PodStatus),
 	}

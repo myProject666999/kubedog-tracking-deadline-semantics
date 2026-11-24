@@ -1,5 +1,11 @@
 # Changelog
 
+## Unreleased
+
+### Changed
+
+* The four-minute no-activity timeout is now a substantive-progress deadline for Deployment, StatefulSet, DaemonSet, and Job. Ordinary events and unrelated status updates no longer extend it. Set `LegacyEventActivityTimeout: true` to temporarily restore the old any-event interval semantics. See `pkg/tracker/deadline/README.md` for the global, per-resource, and progress deadline model.
+
 ## [0.13.0](https://www.github.com/werf/kubedog/compare/v0.12.3...v0.13.0) (2025-01-22)
 
 

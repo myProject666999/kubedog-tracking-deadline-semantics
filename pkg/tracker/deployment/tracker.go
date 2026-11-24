@@ -109,6 +109,7 @@ func NewTracker(name, namespace string, kube kubernetes.Interface, informerFacto
 			SaveLogsOnlyForNumberOfReplicas: opts.SaveLogsOnlyForNumberOfReplicas,
 			LogsFromTime:                    opts.LogsFromTime,
 			InformerFactory:                 informerFactory,
+			Clock:                           opts.Clock,
 		},
 
 		Added:  make(chan DeploymentStatus, 1),

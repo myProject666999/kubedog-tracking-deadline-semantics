@@ -13,6 +13,7 @@ type DaemonSetStatus struct {
 	appsv1.DaemonSetStatus
 
 	StatusGeneration uint64
+	Generation       int64
 
 	ReplicasIndicator  *indicators.Int32EqualConditionIndicator
 	UpToDateIndicator  *indicators.Int32EqualConditionIndicator
@@ -31,6 +32,7 @@ type DaemonSetStatus struct {
 func NewDaemonSetStatus(object *appsv1.DaemonSet, statusGeneration uint64, isTrackerFailed bool, trackerFailedReason string, podsStatuses map[string]pod.PodStatus, newPodsNames []string) DaemonSetStatus {
 	res := DaemonSetStatus{
 		StatusGeneration: statusGeneration,
+		Generation:       object.Generation,
 		DaemonSetStatus:  object.Status,
 		Pods:             make(map[string]pod.PodStatus),
 		NewPodsNames:     newPodsNames,

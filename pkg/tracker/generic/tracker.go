@@ -17,6 +17,7 @@ import (
 	"github.com/werf/kubedog/pkg/informer"
 	"github.com/werf/kubedog/pkg/log"
 	"github.com/werf/kubedog/pkg/resid"
+	"github.com/werf/kubedog/pkg/tracker/deadline"
 )
 
 const ResourceStatusStabilizingDuration time.Duration = 2 * time.Second
@@ -49,6 +50,12 @@ type Tracker struct {
 	discoveryClient discovery.CachedDiscoveryInterface
 	mapper          meta.RESTMapper
 	informerFactory *util.Concurrent[*informer.InformerFactory]
+
+	// Clock controls the activity timer. It is exported so tests can inject a
+	// fake clock after NewTracker. When nil, the real system clock is used.
+	Clock deadline.Clock
+
+	lastStatusSummary deadline.StateSummary
 }
 
 func NewTracker(
@@ -102,6 +109,24 @@ func (t *Tracker) Track(ctx context.Context, noActivityTimeout time.Duration, ad
 
 	eventWatcherCh := make(chan *corev1.Event)
 
+	clock := t.Clock
+	if clock == nil {
+		clock = deadline.SystemClock
+	}
+	trackStartedAt := clock.Now()
+	lastActivityAt := trackStartedAt
+
+	// A single persistent timer is reset after every observed event. The old
+	// time.After call allocated a fresh timer on every loop iteration and both
+	// leaked until firing and made the semantics hard to test.
+	var activityTimer deadline.Timer
+	var activityCh <-chan time.Time
+	if noActivityTimeout > 0 {
+		activityTimer = clock.NewTimer(noActivityTimeout)
+		activityCh = activityTimer.C()
+		defer activityTimer.Stop()
+	}
+
 	for {
 		select {
 		case obj := <-resAddedCh:
@@ -120,14 +145,43 @@ func (t *Tracker) Track(ctx context.Context, noActivityTimeout time.Duration, ad
 			t.handleResourceDeleted(regularCh)
 		case event := <-eventWatcherCh:
 			t.handleEvent(event, eventCh, failedCh)
-		case <-time.After(noActivityTimeout):
-			failedCh <- NewFailedResourceStatus(fmt.Sprintf("marking resource as failed because no activity for %s", noActivityTimeout))
+		case <-activityCh:
+			now := clock.Now()
+			summary := t.lastStatusSummary
+			if summary.ResourceID == "" {
+				summary.ResourceID = t.ResourceID.String()
+			}
+			if summary.Text == "" {
+				summary.Text = "generic resource: no recognized replica progress indicator; activity timeout applies"
+			}
+			deadlineErr := deadline.NewError(
+				deadline.KindProgress,
+				t.ResourceID.String(),
+				now.Sub(trackStartedAt),
+				noActivityTimeout,
+				now.Sub(lastActivityAt),
+				0,
+				summary,
+			)
+			failedCh <- NewFailedResourceStatus(deadlineErr.Error())
+			return deadlineErr
 		case <-ctx.Done():
 			if log.Debug() {
 				fmt.Printf("`%s` tracker context canceled: %s\n", t.ResourceID, context.Cause(ctx))
 			}
 
 			return context.Cause(ctx)
+		}
+
+		if activityTimer != nil {
+			lastActivityAt = clock.Now()
+			if !activityTimer.Stop() {
+				select {
+				case <-activityTimer.C():
+				default:
+				}
+			}
+			activityTimer.Reset(noActivityTimeout)
 		}
 	}
 }

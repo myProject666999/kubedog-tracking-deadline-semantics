@@ -13,6 +13,7 @@ type StatefulSetStatus struct {
 	appsv1.StatefulSetStatus
 
 	StatusGeneration uint64
+	Generation       int64
 
 	ReplicasIndicator *indicators.Int64GreaterOrEqualConditionIndicator
 	ReadyIndicator    *indicators.Int64GreaterOrEqualConditionIndicator
@@ -32,6 +33,7 @@ type StatefulSetStatus struct {
 func NewStatefulSetStatus(object *appsv1.StatefulSet, statusGeneration uint64, isFailed bool, failedReason string, warningMessages []string, podsStatuses map[string]pod.PodStatus, newPodsNames []string) StatefulSetStatus {
 	res := StatefulSetStatus{
 		StatusGeneration:  statusGeneration,
+		Generation:        object.Generation,
 		StatefulSetStatus: object.Status,
 		Pods:              make(map[string]pod.PodStatus),
 		NewPodsNames:      newPodsNames,

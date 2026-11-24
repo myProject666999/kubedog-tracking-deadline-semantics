@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"regexp"
+	"sync"
 	"time"
 
 	"github.com/samber/lo"
@@ -14,7 +15,6 @@ import (
 	"k8s.io/client-go/discovery"
 	"k8s.io/client-go/dynamic"
 	"k8s.io/client-go/kubernetes"
-	watchtools "k8s.io/client-go/tools/watch"
 
 	"github.com/werf/kubedog/pkg/dyntracker/logstore"
 	"github.com/werf/kubedog/pkg/dyntracker/statestore"
@@ -25,6 +25,7 @@ import (
 	commontracker "github.com/werf/kubedog/pkg/tracker"
 	"github.com/werf/kubedog/pkg/tracker/canary"
 	"github.com/werf/kubedog/pkg/tracker/daemonset"
+	"github.com/werf/kubedog/pkg/tracker/deadline"
 	"github.com/werf/kubedog/pkg/tracker/deployment"
 	"github.com/werf/kubedog/pkg/tracker/generic"
 	"github.com/werf/kubedog/pkg/tracker/job"
@@ -45,6 +46,13 @@ type DynamicReadinessTracker struct {
 
 	timeout           time.Duration
 	noActivityTimeout time.Duration
+
+	deadlineConfig     deadline.Config
+	deadlineMonitor    *deadline.Monitor
+	deadlineRegistry   *deadline.Registry
+	ignoredDeadlines   []*deadline.Error
+	ignoredDeadlinesMu sync.Mutex
+	failMode           statestore.FailMode
 
 	saveLogsOnlyForContainers      []string
 	saveLogsByRegex                *regexp.Regexp
@@ -168,17 +176,69 @@ func NewDynamicReadinessTracker(
 		tracker = generic.NewTracker(resid, dynamicClient, discoveryClient, informerFactory, mapper)
 	}
 
+	resourceHumanID := util.ResourceHumanID(resourceName, resourceNamespace, resourceGVK, mapper)
+	deadlineConfig := buildReadinessDeadlineConfig(opts, timeout, noActivityTimeout)
+	switch tracker.(type) {
+	case *generic.Tracker, *pod.Tracker:
+		// These resource classes have no replica-progress indicators, so the
+		// progress budget retains the historical "time since any activity"
+		// meaning rather than substantive-progress semantics.
+		deadlineConfig.LegacyEventActivityTimeout = true
+	}
+	if _, err := deadlineConfig.Normalize(); err != nil {
+		return nil, fmt.Errorf("invalid tracking deadline configuration: %w", err)
+	}
+	deadlineRegistry := opts.DeadlineRegistry
+	if deadlineRegistry == nil {
+		registry, err := deadline.NewRegistry(deadlineConfig)
+		if err != nil {
+			return nil, fmt.Errorf("invalid tracking deadline configuration: %w", err)
+		}
+		deadlineRegistry = registry
+	}
+
+	var deadlineMonitor *deadline.Monitor
+	var terminationMode statestore.TrackTerminationMode
+	taskState.RTransaction(func(ts *statestore.ReadinessTaskState) {
+		terminationMode = ts.TerminationMode()
+	})
+	if opts.TerminationMode != "" {
+		terminationMode = opts.TerminationMode
+	}
+	// Non-blocking tasks do not wait for readiness, so neither progress nor
+	// the waiting-oriented global/per-resource budgets apply.
+	if terminationMode != statestore.NonBlocking {
+		var err error
+		if deadlineRegistry != nil {
+			deadlineMonitor, err = deadlineRegistry.Monitor(resourceHumanID, deadlineConfig)
+		} else {
+			deadlineMonitor, err = deadline.NewMonitor(resourceHumanID, deadlineConfig)
+		}
+		if err != nil {
+			return nil, fmt.Errorf("configure tracking deadlines: %w", err)
+		}
+	}
+	if genericTracker, ok := tracker.(*generic.Tracker); ok {
+		if clock, ok := deadlineConfig.Clock.(deadline.Clock); ok {
+			genericTracker.Clock = clock
+		}
+	}
+
 	return &DynamicReadinessTracker{
 		resourceName:                   resourceName,
 		resourceNamespace:              resourceNamespace,
 		resourceGVK:                    resourceGVK,
-		resourceHumanID:                util.ResourceHumanID(resourceName, resourceNamespace, resourceGVK, mapper),
+		resourceHumanID:                resourceHumanID,
 		taskState:                      taskState,
 		logStore:                       logStore,
 		mapper:                         mapper,
 		tracker:                        tracker,
 		timeout:                        timeout,
 		noActivityTimeout:              noActivityTimeout,
+		deadlineConfig:                 deadlineConfig,
+		deadlineMonitor:                deadlineMonitor,
+		deadlineRegistry:               deadlineRegistry,
+		failMode:                       opts.FailMode,
 		saveLogsOnlyForContainers:      opts.SaveLogsOnlyForContainers,
 		saveLogsByRegex:                opts.SaveLogsByRegex,
 		saveLogsByRegexForContainers:   opts.SaveLogsByRegexForContainers,
@@ -191,8 +251,33 @@ func NewDynamicReadinessTracker(
 }
 
 type DynamicReadinessTrackerOptions struct {
-	Timeout                                  time.Duration
-	NoActivityTimeout                        time.Duration
+	Timeout                     time.Duration
+	NoActivityTimeout           time.Duration
+	GlobalTimeout               time.Duration
+	GlobalDeadlineTimeout       time.Duration
+	PerResourceTimeout          time.Duration
+	DefaultPerResourceTimeout   time.Duration
+	DefaultTimeout              time.Duration
+	ProgressTimeout             time.Duration
+	ProgressDeadline            time.Duration
+	ProgressDeadlineTimeout     time.Duration
+	NoProgressTimeout           bool
+	DisableProgressTimeout      bool
+	ResourceTimeouts            any
+	PerResourceTimeouts         any
+	ResourceTimeoutOverrides    any
+	PerResourceTimeoutOverrides any
+	DeadlineOverrides           any
+	DeadlineConfig              deadline.Config
+	DeadlineRegistry            *deadline.Registry
+	// GlobalDeadline accepts either a time.Duration or *deadline.SharedDeadline.
+	GlobalDeadline                           any
+	Clock                                    deadline.PassiveClock
+	TerminationMode                          statestore.TrackTerminationMode
+	FailMode                                 statestore.FailMode
+	ProgressCheckInterval                    time.Duration
+	LegacyNoActivityEventSemantics           bool
+	LegacyEventActivityTimeout               bool
 	IgnoreReadinessProbeFailsByContainerName map[string]time.Duration
 	CaptureLogsFromTime                      time.Time
 	CaseInsensitiveGVKMatching               bool
@@ -245,7 +330,7 @@ func (t *DynamicReadinessTracker) Track(ctx context.Context) error {
 }
 
 func (t *DynamicReadinessTracker) trackDeployment(ctx context.Context, tracker *deployment.Tracker) error {
-	trackCtx, trackCtxCancelFn := watchtools.ContextWithOptionalTimeout(ctx, t.timeout)
+	trackCtx, trackCtxCancelFn := t.deadlineTrackingContext(ctx)
 	defer trackCtxCancelFn()
 
 	trackErrCh := make(chan error, 1)
@@ -256,8 +341,8 @@ func (t *DynamicReadinessTracker) trackDeployment(ctx context.Context, tracker *
 	for {
 		select {
 		case err := <-trackErrCh:
-			if err != nil && !errors.Is(err, commontracker.ErrStopTrack) {
-				return fmt.Errorf("track resource %q: %w", t.resourceHumanID, err)
+			if waitErr := t.trackWaitError(trackCtx, err); waitErr != nil {
+				return waitErr
 			}
 
 			return nil
@@ -379,7 +464,7 @@ func (t *DynamicReadinessTracker) trackDeployment(ctx context.Context, tracker *
 }
 
 func (t *DynamicReadinessTracker) trackStatefulSet(ctx context.Context, tracker *statefulset.Tracker) error {
-	trackCtx, trackCtxCancelFn := watchtools.ContextWithOptionalTimeout(ctx, t.timeout)
+	trackCtx, trackCtxCancelFn := t.deadlineTrackingContext(ctx)
 	defer trackCtxCancelFn()
 
 	trackErrCh := make(chan error, 1)
@@ -390,8 +475,8 @@ func (t *DynamicReadinessTracker) trackStatefulSet(ctx context.Context, tracker 
 	for {
 		select {
 		case err := <-trackErrCh:
-			if err != nil && !errors.Is(err, commontracker.ErrStopTrack) {
-				return fmt.Errorf("track resource %q: %w", t.resourceHumanID, err)
+			if waitErr := t.trackWaitError(trackCtx, err); waitErr != nil {
+				return waitErr
 			}
 
 			return nil
@@ -499,7 +584,7 @@ func (t *DynamicReadinessTracker) trackStatefulSet(ctx context.Context, tracker 
 }
 
 func (t *DynamicReadinessTracker) trackDaemonSet(ctx context.Context, tracker *daemonset.Tracker) error {
-	trackCtx, trackCtxCancelFn := watchtools.ContextWithOptionalTimeout(ctx, t.timeout)
+	trackCtx, trackCtxCancelFn := t.deadlineTrackingContext(ctx)
 	defer trackCtxCancelFn()
 
 	trackErrCh := make(chan error, 1)
@@ -510,8 +595,8 @@ func (t *DynamicReadinessTracker) trackDaemonSet(ctx context.Context, tracker *d
 	for {
 		select {
 		case err := <-trackErrCh:
-			if err != nil && !errors.Is(err, commontracker.ErrStopTrack) {
-				return fmt.Errorf("track resource %q: %w", t.resourceHumanID, err)
+			if waitErr := t.trackWaitError(trackCtx, err); waitErr != nil {
+				return waitErr
 			}
 
 			return nil
@@ -619,7 +704,7 @@ func (t *DynamicReadinessTracker) trackDaemonSet(ctx context.Context, tracker *d
 }
 
 func (t *DynamicReadinessTracker) trackJob(ctx context.Context, tracker *job.Tracker) error {
-	trackCtx, trackCtxCancelFn := watchtools.ContextWithOptionalTimeout(ctx, t.timeout)
+	trackCtx, trackCtxCancelFn := t.deadlineTrackingContext(ctx)
 	defer trackCtxCancelFn()
 
 	trackErrCh := make(chan error, 1)
@@ -630,8 +715,8 @@ func (t *DynamicReadinessTracker) trackJob(ctx context.Context, tracker *job.Tra
 	for {
 		select {
 		case err := <-trackErrCh:
-			if err != nil && !errors.Is(err, commontracker.ErrStopTrack) {
-				return fmt.Errorf("track resource %q: %w", t.resourceHumanID, err)
+			if waitErr := t.trackWaitError(trackCtx, err); waitErr != nil {
+				return waitErr
 			}
 
 			return nil
@@ -739,7 +824,7 @@ func (t *DynamicReadinessTracker) trackJob(ctx context.Context, tracker *job.Tra
 }
 
 func (t *DynamicReadinessTracker) trackPod(ctx context.Context, tracker *pod.Tracker) error {
-	trackCtx, trackCtxCancelFn := watchtools.ContextWithOptionalTimeout(ctx, t.timeout)
+	trackCtx, trackCtxCancelFn := t.deadlineTrackingContext(ctx)
 	defer trackCtxCancelFn()
 
 	doneChan := make(chan struct{})
@@ -756,8 +841,8 @@ func (t *DynamicReadinessTracker) trackPod(ctx context.Context, tracker *pod.Tra
 	for {
 		select {
 		case err := <-trackErrCh:
-			if err != nil && !errors.Is(err, commontracker.ErrStopTrack) {
-				return fmt.Errorf("track resource %q: %w", t.resourceHumanID, err)
+			if waitErr := t.trackWaitError(trackCtx, err); waitErr != nil {
+				return waitErr
 			}
 
 			return nil
@@ -850,7 +935,7 @@ func (t *DynamicReadinessTracker) trackPod(ctx context.Context, tracker *pod.Tra
 }
 
 func (t *DynamicReadinessTracker) trackCanary(ctx context.Context, tracker *canary.Tracker) error {
-	trackCtx, trackCtxCancelFn := watchtools.ContextWithOptionalTimeout(ctx, t.timeout)
+	trackCtx, trackCtxCancelFn := t.deadlineTrackingContext(ctx)
 	defer trackCtxCancelFn()
 
 	trackErrCh := make(chan error, 1)
@@ -861,8 +946,8 @@ func (t *DynamicReadinessTracker) trackCanary(ctx context.Context, tracker *cana
 	for {
 		select {
 		case err := <-trackErrCh:
-			if err != nil && !errors.Is(err, commontracker.ErrStopTrack) {
-				return fmt.Errorf("track resource %q: %w", t.resourceHumanID, err)
+			if waitErr := t.trackWaitError(trackCtx, err); waitErr != nil {
+				return waitErr
 			}
 
 			return nil
@@ -930,7 +1015,7 @@ func (t *DynamicReadinessTracker) trackCanary(ctx context.Context, tracker *cana
 }
 
 func (t *DynamicReadinessTracker) trackGeneric(ctx context.Context, tracker *generic.Tracker) error {
-	trackCtx, trackCtxCancelFn := watchtools.ContextWithOptionalTimeout(ctx, t.timeout)
+	trackCtx, trackCtxCancelFn := t.deadlineTrackingContext(ctx)
 	defer trackCtxCancelFn()
 
 	addedCh := make(chan *generic.ResourceStatus)
@@ -941,14 +1026,17 @@ func (t *DynamicReadinessTracker) trackGeneric(ctx context.Context, tracker *gen
 
 	trackErrCh := make(chan error, 1)
 	go func() {
-		trackErrCh <- tracker.Track(trackCtx, t.noActivityTimeout, addedCh, succeededCh, failedCh, regularCh, eventCh)
+		// The dynamic layer owns the injectable activity/progress deadline and
+		// cancels trackCtx with a structured cause. Passing zero disables the
+		// generic tracker's standalone wall-clock timer in this integration.
+		trackErrCh <- tracker.Track(trackCtx, 0, addedCh, succeededCh, failedCh, regularCh, eventCh)
 	}()
 
 	for {
 		select {
 		case err := <-trackErrCh:
-			if err != nil && !errors.Is(err, commontracker.ErrStopTrack) {
-				return fmt.Errorf("track resource %q: %w", t.resourceHumanID, err)
+			if waitErr := t.trackWaitError(trackCtx, err); waitErr != nil {
+				return waitErr
 			}
 
 			return nil
@@ -1006,6 +1094,7 @@ func (t *DynamicReadinessTracker) trackGeneric(ctx context.Context, tracker *gen
 				return abortErr
 			}
 		case event := <-eventCh:
+			t.noteActivityDeadline()
 			t.taskState.RTransaction(func(ts *statestore.ReadinessTaskState) {
 				t.handleEventMessage(event.Message, ts, event.EventTime.Time)
 			})
@@ -1078,6 +1167,8 @@ func (t *DynamicReadinessTracker) handlePodsFromJobStatus(status *job.JobStatus,
 }
 
 func (t *DynamicReadinessTracker) handlePodStatus(status *pod.PodStatus, taskState *statestore.ReadinessTaskState) {
+	t.observePodDeadline(status)
+
 	taskState.AddResourceState(status.Name, taskState.Namespace(), podGvk)
 
 	if status.StatusIndicator != nil {
@@ -1164,6 +1255,8 @@ func (t *DynamicReadinessTracker) handlePodsFromJobPodAddedReport(report *job.Po
 }
 
 func (t *DynamicReadinessTracker) handleDeploymentStatus(status *deployment.DeploymentStatus, taskState *statestore.ReadinessTaskState) {
+	t.observeDeploymentDeadline(status)
+
 	if status.ReplicasIndicator != nil {
 		taskState.ResourceState(taskState.Name(), taskState.Namespace(), taskState.GroupVersionKind()).RWTransaction(func(rs *statestore.ResourceState) {
 			setReplicasAttribute(rs, int(status.ReplicasIndicator.TargetValue))
@@ -1193,6 +1286,8 @@ func (t *DynamicReadinessTracker) handleDeploymentStatus(status *deployment.Depl
 }
 
 func (t *DynamicReadinessTracker) handleStatefulSetStatus(status *statefulset.StatefulSetStatus, taskState *statestore.ReadinessTaskState) {
+	t.observeStatefulSetDeadline(status)
+
 	if status.ReplicasIndicator != nil {
 		taskState.ResourceState(taskState.Name(), taskState.Namespace(), taskState.GroupVersionKind()).RWTransaction(func(rs *statestore.ResourceState) {
 			setReplicasAttribute(rs, int(status.ReplicasIndicator.TargetValue))
@@ -1219,6 +1314,8 @@ func (t *DynamicReadinessTracker) handleStatefulSetStatus(status *statefulset.St
 }
 
 func (t *DynamicReadinessTracker) handleDaemonSetStatus(status *daemonset.DaemonSetStatus, taskState *statestore.ReadinessTaskState) {
+	t.observeDaemonSetDeadline(status)
+
 	if status.ReplicasIndicator != nil {
 		taskState.ResourceState(taskState.Name(), taskState.Namespace(), taskState.GroupVersionKind()).RWTransaction(func(rs *statestore.ResourceState) {
 			setReplicasAttribute(rs, int(status.ReplicasIndicator.TargetValue))
@@ -1245,6 +1342,8 @@ func (t *DynamicReadinessTracker) handleDaemonSetStatus(status *daemonset.Daemon
 }
 
 func (t *DynamicReadinessTracker) handleJobStatus(status *job.JobStatus, taskState *statestore.ReadinessTaskState) {
+	t.observeJobDeadline(status)
+
 	taskState.ResourceState(taskState.Name(), taskState.Namespace(), taskState.GroupVersionKind()).RWTransaction(func(rs *statestore.ResourceState) {
 		setReplicasAttribute(rs, 1)
 	})
@@ -1289,6 +1388,10 @@ func (t *DynamicReadinessTracker) handleCanaryStatus(status *canary.CanaryStatus
 }
 
 func (t *DynamicReadinessTracker) handleGenericResourceStatus(status *generic.ResourceStatus, taskState *statestore.ReadinessTaskState) {
+	// Generic resources have no replica-progress indicator. Their progress
+	// deadline intentionally retains activity semantics.
+	t.noteActivityDeadline()
+
 	if status.Indicator != nil {
 		taskState.ResourceState(taskState.Name(), taskState.Namespace(), taskState.GroupVersionKind()).RWTransaction(func(rs *statestore.ResourceState) {
 			setGenericConditionAttributes(rs, status)
@@ -1462,12 +1565,27 @@ func (t *DynamicReadinessTracker) handleEventMessage(msg string, taskState *stat
 
 func (t *DynamicReadinessTracker) handleTaskStateStatus(taskState *statestore.ReadinessTaskState) (abort bool, abortErr error) {
 	taskStateStatus := taskState.Status()
+
+	// Once the root resource is in its durable failed state, no deadline may
+	// replace that failure. Stop before the status switch so both fail-fast
+	// and ignore-failure modes silence all three timers.
+	root := taskState.ResourceState(taskState.Name(), taskState.Namespace(), taskState.GroupVersionKind())
+	var rootStatus statestore.ResourceStatus
+	root.RTransaction(func(rs *statestore.ResourceState) {
+		rootStatus = rs.Status()
+	})
+	if rootStatus == statestore.ResourceStatusFailed {
+		t.stopDeadlineMonitor()
+	}
+
 	switch taskStateStatus {
 	case statestore.ReadinessTaskStatusProgressing:
 	case statestore.ReadinessTaskStatusReady:
+		t.stopDeadlineMonitor()
 		abort = true
 		return abort, abortErr
 	case statestore.ReadinessTaskStatusFailed:
+		t.stopDeadlineMonitor()
 		abort = true
 		abortErr = fmt.Errorf("waiting for resource %q readiness failed", t.resourceHumanID)
 		return abort, abortErr

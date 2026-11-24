@@ -24,6 +24,10 @@ type DeploymentStatus struct {
 	appsv1.DeploymentStatus
 
 	StatusGeneration uint64
+	// Generation is metadata.generation of the Deployment. It changes when
+	// the desired spec (including the pod template) changes even if the replica
+	// target is unchanged.
+	Generation int64
 
 	ReplicasIndicator  *indicators.Int32EqualConditionIndicator
 	UpToDateIndicator  *indicators.Int32EqualConditionIndicator
@@ -46,6 +50,7 @@ type DeploymentStatus struct {
 func NewDeploymentStatus(object *appsv1.Deployment, statusGeneration uint64, isTrackerFailed bool, trackerFailedReason string, podsStatuses map[string]pod.PodStatus, newPodsNames []string) DeploymentStatus {
 	res := DeploymentStatus{
 		StatusGeneration: statusGeneration,
+		Generation:       object.Generation,
 		DeploymentStatus: object.Status,
 		Pods:             make(map[string]pod.PodStatus),
 		NewPodsNames:     newPodsNames,

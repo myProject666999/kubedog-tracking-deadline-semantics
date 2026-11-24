@@ -10,12 +10,12 @@ import (
 	"k8s.io/apimachinery/pkg/api/meta"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime/schema"
-	"k8s.io/apimachinery/pkg/util/wait"
 	"k8s.io/client-go/dynamic"
 
 	"github.com/werf/kubedog/pkg/dyntracker/statestore"
 	"github.com/werf/kubedog/pkg/dyntracker/util"
 	"github.com/werf/kubedog/pkg/informer"
+	"github.com/werf/kubedog/pkg/tracker/deadline"
 )
 
 type DynamicPresenceTracker struct {
@@ -25,6 +25,9 @@ type DynamicPresenceTracker struct {
 	mapper          meta.ResettableRESTMapper
 
 	timeout                    time.Duration
+	globalTimeout              time.Duration
+	globalDeadline             *deadline.SharedDeadline
+	clock                      deadline.Clock
 	pollPeriod                 time.Duration
 	caseInsensitiveGVKMatching bool
 }
@@ -50,12 +53,17 @@ func NewDynamicPresenceTracker(
 		pollPeriod = 1 * time.Second
 	}
 
+	globalDeadline, globalTimeout := globalDeadlineFromOption(opts.GlobalDeadline, opts.GlobalTimeout)
+
 	return &DynamicPresenceTracker{
 		taskState:                  taskState,
 		informerFactory:            informerFactory,
 		dynamicClient:              dynamicClient,
 		mapper:                     mapper,
 		timeout:                    timeout,
+		globalTimeout:              globalTimeout,
+		globalDeadline:             globalDeadline,
+		clock:                      schedulableClock(opts.Clock),
 		pollPeriod:                 pollPeriod,
 		caseInsensitiveGVKMatching: opts.CaseInsensitiveGVKMatching,
 	}
@@ -63,6 +71,9 @@ func NewDynamicPresenceTracker(
 
 type DynamicPresenceTrackerOptions struct {
 	Timeout                    time.Duration
+	GlobalTimeout              time.Duration
+	GlobalDeadline             any
+	Clock                      any
 	PollPeriod                 time.Duration
 	CaseInsensitiveGVKMatching bool
 }
@@ -78,6 +89,10 @@ func (t *DynamicPresenceTracker) Track(ctx context.Context) error {
 		namespace = ts.Namespace()
 		groupVersionKind = ts.GroupVersionKind()
 	})
+
+	if err := validatePollDeadlineConfig(t.timeout, t.globalTimeout); err != nil {
+		return err
+	}
 
 	lookupGVK := groupVersionKind
 	if t.caseInsensitiveGVKMatching {
@@ -103,7 +118,7 @@ func (t *DynamicPresenceTracker) Track(ctx context.Context) error {
 
 	resourceHumanID := util.ResourceHumanID(name, namespace, groupVersionKind, t.mapper)
 
-	if err := wait.PollImmediate(t.pollPeriod, t.timeout, func() (bool, error) {
+	if err := pollWithDeadlines(ctx, t.clock, t.pollPeriod, resourceHumanID, t.timeout, t.globalTimeout, t.globalDeadline, func() (bool, error) {
 		if _, err := resourceClient.Get(ctx, name, metav1.GetOptions{}); err != nil {
 			if apierrors.IsResourceExpired(err) || apierrors.IsGone(err) || err == io.EOF || err == io.ErrUnexpectedEOF {
 				return false, nil
@@ -124,7 +139,7 @@ func (t *DynamicPresenceTracker) Track(ctx context.Context) error {
 
 		return true, nil
 	}); err != nil {
-		return fmt.Errorf("poll resource %q: %w", resourceHumanID, err)
+		return err
 	}
 
 	t.taskState.RWTransaction(func(pts *statestore.PresenceTaskState) {

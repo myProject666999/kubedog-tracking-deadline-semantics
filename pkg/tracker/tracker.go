@@ -9,6 +9,7 @@ import (
 
 	"github.com/werf/kubedog/pkg/dyntracker/util"
 	"github.com/werf/kubedog/pkg/informer"
+	"github.com/werf/kubedog/pkg/tracker/deadline"
 )
 
 var ErrStopTrack = errors.New("stop tracking now")
@@ -37,11 +38,19 @@ type Tracker struct {
 	InformerFactory                 *util.Concurrent[*informer.InformerFactory]
 
 	StatusGeneration uint64
+
+	// Clock is an optional injectable time source. Trackers that create
+	// timers use it; nil means the real clock.
+	Clock deadline.Clock
 }
 
 type Options struct {
 	ParentContext                            context.Context
 	Timeout                                  time.Duration
+	GlobalTimeout                            time.Duration
+	ProgressTimeout                          time.Duration
+	Clock                                    deadline.Clock
+	DeadlineConfig                           deadline.Config
 	LogsFromTime                             time.Time
 	SaveLogsOnlyForNumberOfReplicas          int
 	IgnoreLogs                               bool

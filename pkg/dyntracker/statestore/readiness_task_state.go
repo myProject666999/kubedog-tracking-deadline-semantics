@@ -21,6 +21,8 @@ type ReadinessTaskState struct {
 
 	status             ReadinessTaskStatus
 	uuid               string
+	failMode           FailMode
+	terminationMode    TrackTerminationMode
 	resourceStatesTree domigraph.Graph[string, *util.Concurrent[*ResourceState]]
 }
 
@@ -32,6 +34,11 @@ func NewReadinessTaskState(name, namespace string, groupVersionKind schema.Group
 		failMode = opts.FailMode
 	} else {
 		failMode = FailWholeDeployProcessImmediately
+	}
+
+	terminationMode := opts.TerminationMode
+	if terminationMode == "" {
+		terminationMode = WaitUntilResourceReady
 	}
 
 	resourceStatesTree := domigraph.New[string, *util.Concurrent[*ResourceState]](func(s *util.Concurrent[*ResourceState]) string {
@@ -56,6 +63,8 @@ func NewReadinessTaskState(name, namespace string, groupVersionKind schema.Group
 		groupVersionKind:   groupVersionKind,
 		failureConditions:  failureConditions,
 		readyConditions:    readyConditions,
+		failMode:           failMode,
+		terminationMode:    terminationMode,
 		uuid:               uuid,
 		resourceStatesTree: resourceStatesTree,
 	}
@@ -63,6 +72,7 @@ func NewReadinessTaskState(name, namespace string, groupVersionKind schema.Group
 
 type ReadinessTaskStateOptions struct {
 	FailMode                FailMode
+	TerminationMode         TrackTerminationMode
 	TotalAllowFailuresCount int
 }
 
@@ -76,6 +86,14 @@ func (s *ReadinessTaskState) Namespace() string {
 
 func (s *ReadinessTaskState) GroupVersionKind() schema.GroupVersionKind {
 	return s.groupVersionKind
+}
+
+func (s *ReadinessTaskState) FailMode() FailMode {
+	return s.failMode
+}
+
+func (s *ReadinessTaskState) TerminationMode() TrackTerminationMode {
+	return s.terminationMode
 }
 
 func (s *ReadinessTaskState) AddResourceState(name, namespace string, groupVersionKind schema.GroupVersionKind) {
